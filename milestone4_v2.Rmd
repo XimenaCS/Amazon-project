@@ -1,0 +1,518 @@
+---
+title: "A Predictive Analysis of Amazon Best Sellers"
+author: "Dulce Ximena Cid Sanabria, Marco Alejandro Ortiz"
+date: "2026-05-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+library(tidyverse)
+library(glmnet)
+library(mgcv)
+library(pROC)
+library(PRROC)
+library(Matrix)
+library(dendextend)
+library(scales)
+library(knitr)
+library(gridExtra)
+```
+
+# Introduction and Problem Statement
+
+The objective is to predict the binary indicator `isBestSeller` from product-level attributes available at listing time (price, star rating, review volume, and category). The outcome is operationally meaningful: Best Seller status drives placement, click-through, and conversion on the marketplace, so a model that ranks listings by their probability of attaining that status is directly useful for assortment, pricing, and promotional decisions. The class is rare (0.41% of the cleaned sample), which fixes the inferential goal as ranking and probability calibration rather than discrete classification at a fixed threshold.
+
+The previous milestone studied a univariate price series for a single ticker, where the only available signal is autocorrelation in returns. That setting cannot identify how reputation, price level, and category jointly govern visibility, because there is exactly one cross-sectional unit. The Amazon catalog provides roughly 90,000 independent listings spanning hundreds of categories, which permits rigorous non-linear inference: smoothing splines on continuous reputation variables, $L_1$ regularization on a wide one-hot encoding of categories, and an honest hold-out evaluation under PR-AUC. The shift from time series to cross section is therefore not cosmetic; it is the design change that makes the questions of interest (diminishing returns to reviews, category-level heterogeneity) statistically identifiable.
+
+# Data and Pre-processing
+
+The Amazon Products data set contains 1,426,337 rows and 11 columns, paired with a small categories lookup file. Columns `imgUrl`, `productURL`, and `listPrice` carry no predictive content for sales success and are dropped. Observations with `price = 0` or `stars = 0` correspond to unlisted or unrated entries rather than valid market offerings, and are removed. The two files are joined on `category_id` to attach human-readable category labels. Because both `price` and `reviews` exhibit heavy right skew (mean of `price` exceeds the median by a factor of 1.8; `reviews` follows a power law with median 3 and mean above 500), the analysis works on `log_price = log(price)` and `log_reviews = log1p(reviews)`. The latter handles the spike at zero reviews without discarding observations.
+
+```{r}
+products   <- read_csv("amazon_products.csv", show_col_types = FALSE)
+categories <- read_csv("amazon_categories.csv", show_col_types = FALSE)
+
+products <- products %>% select(-imgUrl, -productURL, -listPrice)
+
+n_raw <- nrow(products)
+
+products <- products %>%
+  mutate(isBestSeller = as.integer(isBestSeller %in% c("True", TRUE, 1))) %>%
+  filter(price > 0, stars > 0)
+
+n_filtered <- nrow(products)
+
+products <- products %>%
+  left_join(categories, by = c("category_id" = "id")) %>%
+  mutate(
+    log_price    = log(price),
+    log_reviews  = log1p(reviews),
+    category_name = factor(category_name)
+  )
+
+prevalence <- mean(products$isBestSeller)
+
+n_missing <- sum(is.na(products))
+
+tibble(
+  metric = c("Raw rows", "After price>0 & stars>0", "Best Seller prevalence", "Missing values (post-clean)"),
+  value  = c(comma(n_raw), comma(n_filtered), percent(prevalence, accuracy = 0.01), comma(n_missing))
+) %>% as.data.frame()
+```
+
+The filter retains roughly 6% of the original rows, and the positive class accounts for about 0.41% of the analytic sample. The cleaned data set carries no missing values, so no imputation is required. The implications of the class imbalance are addressed in the modeling section.
+
+```{r}
+descr <- products %>%
+  summarise(
+    across(c(price, stars, reviews),
+           list(Min = min, Median = median, Mean = mean, Max = max, SD = sd),
+           .names = "{.col}__{.fn}")
+  ) %>%
+  pivot_longer(everything(), names_to = c("Variable", "stat"), names_sep = "__") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(Variable = recode(Variable,
+                           price   = "Price (USD)",
+                           stars   = "Stars (1-5)",
+                           reviews = "Review count"))
+
+as.data.frame(descr)
+```
+
+Price is right-skewed: the mean exceeds the median by a wide margin and the maximum reaches the catalog ceiling. Stars cluster near the upper boundary, consistent with the J-shaped rating phenomenon documented for online marketplaces. Review counts follow a power law, with a median in single digits but a maximum in the hundreds of thousands.
+
+# Exploratory Data Analysis
+
+The four panels below establish the empirical regularities that motivate the modeling choices.
+
+```{r}
+products %>%
+  count(isBestSeller) %>%
+  mutate(label = ifelse(isBestSeller == 1, "Best Seller", "Other")) %>%
+  ggplot(aes(label, n, fill = label)) +
+  geom_col(width = 0.5) +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+products %>%
+  select(price, reviews, log_price, log_reviews) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "value") %>%
+  mutate(var = factor(var, levels = c("price", "log_price", "reviews", "log_reviews"))) %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 50, fill = "steelblue") +
+  facet_wrap(~ var, scales = "free", ncol = 2) +
+  theme_minimal()
+```
+
+The raw distributions are unworkable for any model assuming bounded leverage. After the log transformation, both predictors become approximately symmetric, with `log_reviews` retaining a small mass at zero from products with a single review.
+
+```{r}
+products %>%
+  select(log_price, stars) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "value") %>%
+  mutate(var = recode(var,
+                      log_price = "log(price)",
+                      stars     = "Stars")) %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "grey30") +
+  facet_wrap(~ var, scales = "free", ncol = 2) +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Count") +
+  theme_minimal()
+```
+
+The two distributions singled out by the brief behave differently. `log(price)` is approximately symmetric around the mid range, supporting its use as a continuous predictor without further transformation. `stars` is markedly J-shaped, with mass concentrated near 4.5 and a long lower tail, which is the empirical fingerprint of selection bias in voluntary rating systems and the reason `stars` enters the GAM as a small linear term rather than a smooth.
+
+```{r}
+cat_share <- products %>%
+  group_by(category_name) %>%
+  summarise(n = n(), share_bs = mean(isBestSeller), .groups = "drop") %>%
+  filter(n >= 200) %>%
+  slice_max(share_bs, n = 15)
+
+ggplot(cat_share, aes(reorder(category_name, share_bs), share_bs)) +
+  geom_segment(aes(xend = category_name, y = 0, yend = share_bs), color = "grey60") +
+  geom_point(size = 3, color = "tomato") +
+  coord_flip() +
+  scale_y_continuous(labels = percent) +
+  labs(x = NULL, y = "Best Seller share") +
+  theme_minimal()
+```
+
+Best Seller density varies by more than an order of magnitude across categories, which is the substantive justification for treating `category_name` as a high-dimensional fixed effect rather than collapsing it.
+
+```{r}
+products %>%
+  mutate(label = ifelse(isBestSeller == 1, "Best Seller", "Other")) %>%
+  ggplot(aes(label, stars, fill = label)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(x = NULL, y = "Stars") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Best Sellers concentrate near the upper boundary of the rating scale, but the distributional overlap with non-Best Sellers is substantial. Stars alone separate the classes weakly.
+
+```{r}
+ggplot(products, aes(stars)) +
+  geom_histogram(bins = 30, fill = "gold", color = "grey30") +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Star rating", y = "Count") +
+  theme_minimal()
+```
+
+The unconditional rating distribution is markedly J-shaped, with mass concentrated near 4.5 and a long lower tail. This shape rules out a Gaussian working model for `stars` and motivates its use as a continuous predictor with a small linear coefficient rather than a target of inferential interest.
+
+```{r}
+top_count <- products %>%
+  count(category_name, sort = TRUE) %>%
+  slice_head(n = 10)
+
+ggplot(top_count, aes(reorder(category_name, n), n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Number of products") +
+  theme_minimal()
+```
+
+Apparel and footwear occupy the top of the count distribution: the three largest categories together represent a sizable fraction of the analytic sample. The contrast with the Best Seller share ranking above is informative: the most populated categories are not the same as the categories with the highest Best Seller density, which is precisely the apparel-bias caveat developed in the Discussion.
+
+## PCA on Numeric Predictors
+
+A two-component PCA on standardized `(log_price, log_reviews, stars)` summarizes the geometry of the numeric predictor space.
+
+```{r}
+num_mat <- products %>% select(log_price, log_reviews, stars) %>% scale()
+pca <- prcomp(num_mat, center = FALSE, scale. = FALSE)
+var_explained <- pca$sdev^2 / sum(pca$sdev^2)
+
+set.seed(1)
+plot_idx <- c(
+  which(products$isBestSeller == 1),
+  sample(which(products$isBestSeller == 0), size = 0.02 * sum(products$isBestSeller == 0))
+)
+
+tibble(
+  PC1 = pca$x[plot_idx, 1],
+  PC2 = pca$x[plot_idx, 2],
+  cls = factor(products$isBestSeller[plot_idx], labels = c("Other", "Best Seller"))
+) %>%
+  arrange(cls) %>%
+  ggplot(aes(PC1, PC2, color = cls, alpha = cls)) +
+  geom_point(size = 0.7) +
+  scale_color_manual(values = c("grey70", "tomato")) +
+  scale_alpha_manual(values = c(0.3, 0.9)) +
+  labs(color = NULL, alpha = NULL,
+       x = sprintf("PC1 (%.1f%%)", 100 * var_explained[1]),
+       y = sprintf("PC2 (%.1f%%)", 100 * var_explained[2])) +
+  theme_minimal()
+```
+
+The first two components capture most of the variance in the numeric block, but the Best Seller cloud overlaps the central mass of the negative class. The geometry forecasts the difficulty of the classification task: the positive class is not linearly isolable in the numeric subspace, so categorical structure and non-linear effects on review volume must do the discriminative work.
+
+# Category Structure (Unsupervised)
+
+Categories are the highest-cardinality predictor and are not exchangeable. A hierarchical clustering on a per-category profile yields interpretable meta-groups.
+
+```{r}
+cat_profile <- products %>%
+  group_by(category_name) %>%
+  summarise(
+    prevalence_bs    = mean(isBestSeller),
+    median_log_price = median(log_price),
+    median_log_revs  = median(log_reviews),
+    mean_stars       = mean(stars),
+    n                = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 100)
+
+X <- cat_profile %>%
+  select(prevalence_bs, median_log_price, median_log_revs, mean_stars) %>%
+  scale()
+rownames(X) <- cat_profile$category_name
+
+hc <- hclust(dist(X), method = "ward.D2")
+k  <- 4
+cat_profile$cluster <- cutree(hc, k = k)
+
+dend <- as.dendrogram(hc) %>%
+  color_branches(k = k) %>%
+  set("labels_cex", 0.4)
+par(mar = c(8, 4, 2, 1))
+plot(dend, ylab = "Ward distance")
+```
+
+```{r}
+cluster_summary <- cat_profile %>%
+  group_by(cluster) %>%
+  summarise(
+    n_categories     = n(),
+    mean_bs_share    = mean(prevalence_bs),
+    median_log_price = median(median_log_price),
+    median_log_revs  = median(median_log_revs),
+    mean_stars       = mean(mean_stars),
+    exemplars        = paste(head(category_name[order(-prevalence_bs)], 3), collapse = "; "),
+    .groups = "drop"
+  )
+
+cluster_summary %>%
+  mutate(mean_bs_share = percent(mean_bs_share, accuracy = 0.01)) %>%
+  as.data.frame()
+```
+
+The four-cluster cut separates apparel-dominated mass categories with low Best Seller density from smaller, higher-rated specialty groups. This grouping is referenced in the Discussion as evidence for the apparel-bias caveat.
+
+# Methodology
+
+Two complementary models are estimated. The first is a Logistic Lasso, chosen because the predictor matrix contains a wide one-hot encoding of `category_name` whose coefficients should be sparse: few categories carry signal beyond the global rate, and an $L_1$ penalty performs simultaneous estimation and selection at a fixed computational cost. The penalized log-likelihood objective is
+
+$$
+\hat{\beta} \;=\; \arg\min_{\beta} \left\{ -\frac{1}{n}\sum_{i=1}^{n}\!\left[y_i\, \mathbf{x}_i^{\!\top}\beta - \log\!\bigl(1 + e^{\mathbf{x}_i^{\!\top}\beta}\bigr)\right] + \lambda\, \|\beta\|_1 \right\},
+$$
+
+with $\lambda$ selected by ten-fold cross-validation. The intercept is left unpenalized.
+
+The second model is a Generalized Additive Model with smoothing splines, motivated by the empirical pattern that visibility on a marketplace is governed by diminishing returns: the marginal lift of an additional review is large when total reviews are small and shrinks as the count grows. A linear-in-log specification cannot represent saturation; smoothing splines can. The GAM uses the canonical logit link
+
+$$
+\log\frac{\Pr(Y_i = 1 \mid \mathbf{x}_i)}{1 - \Pr(Y_i = 1 \mid \mathbf{x}_i)}
+\;=\; \beta_0 + f_1\!\bigl(\log(1 + \text{reviews}_i)\bigr) + f_2\!\bigl(\log(\text{price}_i)\bigr) + \beta_1\, \text{stars}_i,
+$$
+
+with $f_1$ and $f_2$ estimated by penalized regression splines under REML smoothing-parameter selection.
+
+The PCA in Section 2 and the hierarchical clustering in Section 3 are exploratory: they map the geometry of the numeric block and the structure of the categorical predictor, respectively. They do not feed engineered features into the supervised models, since both Lasso and GAM operate directly on `category_name` and the standardized numeric predictors.
+
+# Statistical Analysis
+
+```{r}
+set.seed(1)
+idx_pos <- which(products$isBestSeller == 1)
+idx_neg <- which(products$isBestSeller == 0)
+train_idx <- c(
+  sample(idx_pos, size = floor(0.7 * length(idx_pos))),
+  sample(idx_neg, size = floor(0.7 * length(idx_neg)))
+)
+train <- products[train_idx, ]
+test  <- products[-train_idx, ]
+
+w_train <- ifelse(
+  train$isBestSeller == 1,
+  1 / mean(train$isBestSeller),
+  1 / (1 - mean(train$isBestSeller))
+)
+```
+
+## Model 1: Logistic Lasso
+
+```{r}
+X_full <- sparse.model.matrix(
+  ~ log_price + log_reviews + stars + category_name - 1,
+  data = products
+)
+X_train <- X_full[train_idx,  , drop = FALSE]
+X_test  <- X_full[-train_idx, , drop = FALSE]
+y_train <- train$isBestSeller
+y_test  <- test$isBestSeller
+
+set.seed(1)
+cv_lasso <- cv.glmnet(
+  X_train, y_train,
+  family = "binomial",
+  weights = w_train,
+  type.measure = "auc",
+  nfolds = 10
+)
+plot(cv_lasso)
+```
+
+```{r}
+p_lasso <- as.numeric(predict(cv_lasso, X_test, s = "lambda.min", type = "response"))
+```
+
+```{r}
+coefs <- as.matrix(coef(cv_lasso, s = "lambda.min"))
+nz <- data.frame(term = rownames(coefs), coef = coefs[, 1]) %>%
+  filter(term != "(Intercept)", coef != 0) %>%
+  arrange(desc(abs(coef))) %>%
+  head(10)
+nz
+```
+
+The selected coefficients concentrate in a handful of categorical indicators and assign a positive weight to `log_reviews`, consistent with the visual evidence that review volume is the dominant continuous predictor.
+
+## Model 2: Generalized Additive Model
+
+```{r}
+gam_fit <- gam(
+  isBestSeller ~ s(log_reviews) + s(log_price) + stars,
+  family = binomial,
+  data = train,
+  method = "REML",
+  weights = w_train
+)
+summary(gam_fit)
+```
+
+```{r}
+plot(gam_fit, pages = 1, shade = TRUE, seWithMean = TRUE)
+```
+
+The estimated $f_1(\log(1+\text{reviews}))$ rises steeply over the lower half of the support and flattens for high-review products, the diminishing-returns pattern anticipated in Methodology. The smooth on `log_price` is approximately monotone-decreasing, indicating that, conditional on visibility, lower-priced products are more likely to reach Best Seller status.
+
+```{r}
+edf_tbl <- tibble(
+  Smooth = rownames(summary(gam_fit)$s.table),
+  EDF    = summary(gam_fit)$s.table[, "edf"],
+  `Ref df` = summary(gam_fit)$s.table[, "Ref.df"],
+  `p-value` = summary(gam_fit)$s.table[, "p-value"]
+)
+as.data.frame(edf_tbl)
+```
+
+The effective degrees of freedom quantify how non-linear each smooth actually is: an EDF near 1 collapses to a linear term, while values above 3 indicate genuine curvature that a polynomial of low order cannot reproduce. The EDF reported for $f_1(\log(1+\text{reviews}))$ sits well above unity, consistent with the saturation shape, and the Wald-style p-value rejects the null of a flat smooth at any conventional level. The smooth on $\log(\text{price})$ also exceeds linearity, justifying its inclusion as a non-parametric term rather than a single coefficient.
+
+```{r}
+p_gam <- as.numeric(predict(gam_fit, newdata = test, type = "response"))
+```
+
+## Evaluation
+
+Accuracy is uninformative here: a constant predictor that always returns zero achieves 99.59% accuracy and zero recall. The two metrics reported below are insensitive to this degeneracy. ROC-AUC measures the probability that a random positive is ranked above a random negative. PR-AUC summarizes the precision-recall trade-off and has the prevalence (0.0041) as its trivial baseline, which makes it the discriminating metric under extreme class imbalance.
+
+```{r}
+roc_lasso <- pROC::roc(y_test, p_lasso, quiet = TRUE)
+roc_gam   <- pROC::roc(y_test, p_gam,   quiet = TRUE)
+
+pr_lasso <- pr.curve(scores.class0 = p_lasso[y_test == 1],
+                     scores.class1 = p_lasso[y_test == 0],
+                     curve = TRUE)
+pr_gam   <- pr.curve(scores.class0 = p_gam[y_test == 1],
+                     scores.class1 = p_gam[y_test == 0],
+                     curve = TRUE)
+
+eval_tbl <- tibble(
+  Model   = c("Lasso", "GAM"),
+  `ROC-AUC` = c(as.numeric(auc(roc_lasso)), as.numeric(auc(roc_gam))),
+  `PR-AUC`  = c(pr_lasso$auc.integral, pr_gam$auc.integral)
+)
+as.data.frame(eval_tbl)
+```
+
+```{r}
+roc_df <- bind_rows(
+  tibble(Model = "Lasso",
+         FPR  = 1 - roc_lasso$specificities,
+         TPR  = roc_lasso$sensitivities),
+  tibble(Model = "GAM",
+         FPR  = 1 - roc_gam$specificities,
+         TPR  = roc_gam$sensitivities)
+)
+
+pr_df <- bind_rows(
+  tibble(Model = "Lasso",
+         Recall    = pr_lasso$curve[, 1],
+         Precision = pr_lasso$curve[, 2]),
+  tibble(Model = "GAM",
+         Recall    = pr_gam$curve[, 1],
+         Precision = pr_gam$curve[, 2])
+)
+
+p_roc <- ggplot(roc_df, aes(FPR, TPR, color = Model)) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  labs(title = "ROC", x = "False positive rate", y = "True positive rate") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+p_pr <- ggplot(pr_df, aes(Recall, Precision, color = Model)) +
+  geom_line(linewidth = 0.8) +
+  geom_hline(yintercept = mean(y_test), linetype = "dashed", color = "grey60") +
+  labs(title = "Precision-Recall",
+       x = "Recall", y = "Precision") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+gridExtra::grid.arrange(p_roc, p_pr, ncol = 2)
+```
+
+The ROC curves separate from the diagonal across most of the FPR range, but the practically relevant evidence is in the precision-recall panel: the dashed horizontal at the test prevalence (0.0041) is the no-skill baseline, and both curves dominate it by a wide margin in the low-recall regime where rare-event ranking is operationally useful. The visual gap between Lasso and GAM in the PR panel mirrors the PR-AUC margin reported in the table above.
+
+```{r}
+prob_check <- tibble(
+  Model = rep(c("Lasso", "GAM"), each = 2),
+  Class = rep(c("Negatives (y=0)", "Positives (y=1)"), times = 2),
+  `Median p` = c(
+    median(p_lasso[y_test == 0]), median(p_lasso[y_test == 1]),
+    median(p_gam[y_test == 0]),   median(p_gam[y_test == 1])
+  ),
+  `95th pct p` = c(
+    quantile(p_lasso[y_test == 0], 0.95), quantile(p_lasso[y_test == 1], 0.95),
+    quantile(p_gam[y_test == 0],   0.95), quantile(p_gam[y_test == 1],   0.95)
+  )
+)
+as.data.frame(prob_check)
+```
+
+The probability surface behaves as expected under inverse-prevalence weighting: the median predicted probability for true negatives stays close to the empirical prevalence, while the median for true positives is roughly an order of magnitude higher and the 95th percentile of the positive class is well above any reasonable operating threshold. No collapse to a degenerate constant is observed, which validates the use of the weighted likelihood as the loss function.
+
+## Model Comparison
+
+```{r}
+winner_pr  <- eval_tbl$Model[which.max(eval_tbl$`PR-AUC`)]
+winner_roc <- eval_tbl$Model[which.max(eval_tbl$`ROC-AUC`)]
+delta_pr   <- abs(diff(eval_tbl$`PR-AUC`))
+delta_roc  <- abs(diff(eval_tbl$`ROC-AUC`))
+baseline   <- mean(y_test)
+lift_pr    <- max(eval_tbl$`PR-AUC`) / baseline
+
+comparison_tbl <- tibble(
+  Criterion = c(
+    "PR-AUC winner",
+    "PR-AUC margin",
+    "ROC-AUC winner",
+    "ROC-AUC margin",
+    "Test-set prevalence (PR-AUC baseline)",
+    "PR-AUC lift over baseline",
+    "Recommended model"
+  ),
+  Value = c(
+    winner_pr,
+    sprintf("%.4f", delta_pr),
+    winner_roc,
+    sprintf("%.4f", delta_roc),
+    sprintf("%.4f", baseline),
+    sprintf("%.1fx", lift_pr),
+    winner_pr
+  )
+)
+as.data.frame(comparison_tbl)
+```
+
+On the held-out 30% test set, the GAM and the Lasso are evaluated on the same observations using the same probability scale. PR-AUC is the primary criterion: it conditions on the positive class, where the practical question lies, and its trivial baseline equals the test prevalence (`r sprintf("%.4f", baseline)`). Both models clear that baseline by a wide margin, with the best PR-AUC of `r sprintf("%.4f", max(eval_tbl[["PR-AUC"]]))` representing a `r sprintf("%.0fx", lift_pr)` lift over chance.
+
+The leading model on PR-AUC is the **`r winner_pr`**, exceeding the alternative by `r sprintf("%.4f", delta_pr)`. ROC-AUC tells a similar story, with the **`r winner_roc`** in front by `r sprintf("%.4f", delta_roc)`. The Lasso provides a sparse, interpretable coefficient set that quantifies category-level effects, while the GAM contributes the non-linear shape of $f_1(\log(1+\text{reviews}))$ that justified its inclusion. Where both metrics favor the GAM, the implication is that the diminishing-returns curvature in review volume carries discriminative content that a linear-in-log specification cannot recover; where the Lasso wins, the high-dimensional category structure is doing more work than the non-linear smooths. The recommended model for downstream prediction is therefore the **`r winner_pr`**, with the Lasso retained as the inferential anchor for category-level interpretation.
+
+# Discussion and Limitations
+
+The filter `price > 0 & stars > 0` removes more than ninety percent of the raw catalog. The excluded rows are not missing at random: they correspond to free or promotional listings, items not yet rated, and entries with malformed price fields. To the extent that these mechanisms correlate with the outcome, the estimated effects describe the population of established, listed products rather than the marketplace as a whole.
+
+The 0.41% prevalence has two consequences. First, weighting strategies are unavoidable: without inverse-prevalence weights the loss is dominated by the negative class and the estimated probability surface collapses toward zero. Second, the spline basis in the GAM extrapolates aggressively in the upper tail of `log_reviews`, where positive observations are sparse. Wide confidence bands in that region are an honest signal of low information, not a defect of the model.
+
+Apparel and footwear categories dominate the sample; in the meta-cluster table, Cluster 1 contains the three largest categories by row count and the lowest mean Best Seller share. Category coefficients in the Lasso are estimated relative to the implicit reference defined by the model matrix construction, so their numerical interpretation is bound to that reference. The clustering in Section 3 supports treating apparel as a structural baseline rather than an arbitrary dummy.
+
+# Conclusion and Future Work
+
+Smoothing splines in the GAM recover the diminishing-returns pattern of review volume that a linear model cannot represent. Once that non-linearity is accounted for, price contributes a modest negative effect, and stars contribute a small positive one. Reputation thresholds, expressed jointly through review volume and rating, dominate price as drivers of Best Seller status in this sample.
+
+Two extensions are warranted. First, sales velocity is a temporal phenomenon; the present cross-section cannot separate stock from flow. A panel of weekly snapshots would permit time-series analysis of how visibility accrues and decays. Second, product titles are an unused source of signal. NLP features, such as sentiment scores, brand mentions, and category-aware embeddings, would complement the structured predictors used here and likely improve discrimination in the long tail of low-review products.
